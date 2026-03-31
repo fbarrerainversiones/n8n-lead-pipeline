@@ -1,0 +1,211 @@
+{
+  "name": "Lead Processor — Meta Ads → AI Qualification → Supabase",
+  "nodes": [
+    {
+      "id": "webhook-trigger",
+      "name": "Meta Ads Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "position": [240, 300],
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "meta-lead-webhook",
+        "responseMode": "onReceived"
+      },
+      "notes": "Receives lead form submissions from Meta Ads (Facebook/Instagram)"
+    },
+    {
+      "id": "parse-lead",
+      "name": "Parse Lead Data",
+      "type": "n8n-nodes-base.set",
+      "position": [440, 300],
+      "parameters": {
+        "values": {
+          "string": [
+            { "name": "full_name", "value": "={{ $json.body.full_name || $json.body.field_data.find(f => f.name === 'full_name')?.values[0] || 'Unknown' }}" },
+            { "name": "phone", "value": "={{ $json.body.phone_number || $json.body.field_data.find(f => f.name === 'phone_number')?.values[0] || '' }}" },
+            { "name": "email", "value": "={{ $json.body.email || $json.body.field_data.find(f => f.name === 'email')?.values[0] || '' }}" },
+            { "name": "form_name", "value": "={{ $json.body.form_name || 'meta_form' }}" },
+            { "name": "form_id", "value": "={{ $json.body.form_id || '' }}" }
+          ]
+        }
+      },
+      "notes": "Normalizes lead data from different Meta form formats"
+    },
+    {
+      "id": "detect-country",
+      "name": "Detect Country (Phone Prefix)",
+      "type": "n8n-nodes-base.switch",
+      "position": [640, 300],
+      "parameters": {
+        "dataType": "string",
+        "value1": "={{ $json.phone.substring(0, 4) }}",
+        "rules": [
+          { "value2": "+593", "output": 0 },
+          { "value2": "+57", "output": 1 },
+          { "value2": "+51", "output": 2 }
+        ],
+        "fallbackOutput": 3
+      },
+      "notes": "Routes leads by country: +593=Ecuador, +57=Colombia, +51=Peru"
+    },
+    {
+      "id": "set-ecuador",
+      "name": "Set Country: Ecuador",
+      "type": "n8n-nodes-base.set",
+      "position": [840, 180],
+      "parameters": {
+        "values": { "string": [{ "name": "country", "value": "Ecuador" }, { "name": "country_code", "value": "+593" }] }
+      }
+    },
+    {
+      "id": "set-colombia",
+      "name": "Set Country: Colombia",
+      "type": "n8n-nodes-base.set",
+      "position": [840, 300],
+      "parameters": {
+        "values": { "string": [{ "name": "country", "value": "Colombia" }, { "name": "country_code", "value": "+57" }] }
+      }
+    },
+    {
+      "id": "set-peru",
+      "name": "Set Country: Peru",
+      "type": "n8n-nodes-base.set",
+      "position": [840, 420],
+      "parameters": {
+        "values": { "string": [{ "name": "country", "value": "Peru" }, { "name": "country_code", "value": "+51" }] }
+      }
+    },
+    {
+      "id": "check-duplicate",
+      "name": "Check Duplicate in Supabase",
+      "type": "n8n-nodes-base.httpRequest",
+      "position": [1040, 300],
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $env.SUPABASE_URL }}/rest/v1/leads",
+        "qs": {
+          "phone": "eq.{{ $json.phone }}",
+          "select": "id,created_at",
+          "limit": "1"
+        },
+        "headers": {
+          "apikey": "={{ $env.SUPABASE_KEY }}",
+          "Authorization": "Bearer {{ $env.SUPABASE_KEY }}"
+        }
+      },
+      "notes": "Prevents duplicate leads from Meta webhook retries"
+    },
+    {
+      "id": "is-duplicate",
+      "name": "Is Duplicate?",
+      "type": "n8n-nodes-base.if",
+      "position": [1240, 300],
+      "parameters": {
+        "conditions": {
+          "number": [{ "value1": "={{ $json.length }}", "operation": "larger", "value2": 0 }]
+        }
+      }
+    },
+    {
+      "id": "ai-qualification",
+      "name": "Gemini AI Qualification",
+      "type": "n8n-nodes-base.httpRequest",
+      "position": [1440, 400],
+      "parameters": {
+        "method": "POST",
+        "url": "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent",
+        "qs": { "key": "={{ $env.GEMINI_API_KEY }}" },
+        "headers": { "Content-Type": "application/json" },
+        "body": {
+          "contents": [{
+            "parts": [{
+              "text": "You are a lead qualification assistant. Analyze this lead and provide a qualification score from 1-10 and a brief assessment.\n\nLead Data:\n- Name: {{ $node['Parse Lead Data'].json.full_name }}\n- Phone: {{ $node['Parse Lead Data'].json.phone }}\n- Email: {{ $node['Parse Lead Data'].json.email }}\n- Country: {{ $json.country }}\n- Form: {{ $node['Parse Lead Data'].json.form_name }}\n\nRespond in JSON format: {\"score\": <1-10>, \"notes\": \"<assessment>\", \"recommended_action\": \"<action>\"}"
+            }]
+          }],
+          "generationConfig": { "maxOutputTokens": 8192, "temperature": 0.3 }
+        }
+      },
+      "notes": "Sends lead data to Gemini 2.5 Flash for AI-powered qualification scoring"
+    },
+    {
+      "id": "parse-ai-response",
+      "name": "Parse AI Response",
+      "type": "n8n-nodes-base.code",
+      "position": [1640, 400],
+      "parameters": {
+        "jsCode": "// Extract JSON from Gemini response\nconst text = $input.first().json.candidates[0].content.parts[0].text;\nconst jsonMatch = text.match(/\\{[\\s\\S]*\\}/);\nlet qualification = { score: 5, notes: 'Unable to parse', recommended_action: 'Manual review' };\n\ntry {\n  if (jsonMatch) {\n    qualification = JSON.parse(jsonMatch[0]);\n  }\n} catch (e) {\n  qualification.notes = 'Parse error: ' + text.substring(0, 200);\n}\n\nreturn [{ json: { ...qualification, qualified_at: new Date().toISOString() } }];"
+      },
+      "notes": "Extracts and validates the JSON qualification response from Gemini"
+    },
+    {
+      "id": "store-supabase",
+      "name": "Store Lead in Supabase",
+      "type": "n8n-nodes-base.httpRequest",
+      "position": [1840, 400],
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SUPABASE_URL }}/rest/v1/leads",
+        "headers": {
+          "apikey": "={{ $env.SUPABASE_KEY }}",
+          "Authorization": "Bearer {{ $env.SUPABASE_KEY }}",
+          "Content-Type": "application/json",
+          "Prefer": "return=representation"
+        },
+        "body": "={{ JSON.stringify({ full_name: $node['Parse Lead Data'].json.full_name, phone: $node['Parse Lead Data'].json.phone, email: $node['Parse Lead Data'].json.email, country: $node['Detect Country (Phone Prefix)'].json.country, country_code: $node['Detect Country (Phone Prefix)'].json.country_code, form_name: $node['Parse Lead Data'].json.form_name, qualification_score: $json.score, qualification_notes: $json.notes, status: 'qualified', processed_at: new Date().toISOString() }) }}"
+      },
+      "notes": "Inserts qualified lead into Supabase with all metadata"
+    },
+    {
+      "id": "send-email-alert",
+      "name": "Send HTML Email Alert",
+      "type": "n8n-nodes-base.emailSend",
+      "position": [2040, 400],
+      "parameters": {
+        "fromEmail": "alerts@yourdomain.com",
+        "toEmail": "advisor@yourdomain.com",
+        "subject": "🔔 New Lead: {{ $node['Parse Lead Data'].json.full_name }} (Score: {{ $node['Parse AI Response'].json.score }}/10)",
+        "html": "<div style='font-family: Arial; max-width: 600px; margin: 0 auto;'><h2 style='color: #c9a84c;'>New Qualified Lead</h2><table style='width: 100%; border-collapse: collapse;'><tr><td style='padding: 8px; border-bottom: 1px solid #eee; font-weight: bold;'>Name</td><td style='padding: 8px; border-bottom: 1px solid #eee;'>{{ $node['Parse Lead Data'].json.full_name }}</td></tr><tr><td style='padding: 8px; border-bottom: 1px solid #eee; font-weight: bold;'>Phone</td><td style='padding: 8px; border-bottom: 1px solid #eee;'>{{ $node['Parse Lead Data'].json.phone }}</td></tr><tr><td style='padding: 8px; border-bottom: 1px solid #eee; font-weight: bold;'>Country</td><td style='padding: 8px; border-bottom: 1px solid #eee;'>{{ $json.country }}</td></tr><tr><td style='padding: 8px; border-bottom: 1px solid #eee; font-weight: bold;'>Score</td><td style='padding: 8px; border-bottom: 1px solid #eee; color: {{ $node['Parse AI Response'].json.score >= 7 ? '#4caf50' : '#ff9800' }};'><strong>{{ $node['Parse AI Response'].json.score }}/10</strong></td></tr><tr><td style='padding: 8px; border-bottom: 1px solid #eee; font-weight: bold;'>AI Notes</td><td style='padding: 8px; border-bottom: 1px solid #eee;'>{{ $node['Parse AI Response'].json.notes }}</td></tr><tr><td style='padding: 8px; font-weight: bold;'>Action</td><td style='padding: 8px;'>{{ $node['Parse AI Response'].json.recommended_action }}</td></tr></table></div>"
+      },
+      "notes": "Sends rich HTML email alert to advisor with lead details and AI qualification"
+    },
+    {
+      "id": "error-handler",
+      "name": "Error Handler",
+      "type": "n8n-nodes-base.errorTrigger",
+      "position": [240, 500],
+      "parameters": {},
+      "notes": "Catches workflow errors and logs them"
+    },
+    {
+      "id": "log-error",
+      "name": "Log Error Email",
+      "type": "n8n-nodes-base.emailSend",
+      "position": [440, 500],
+      "parameters": {
+        "fromEmail": "alerts@yourdomain.com",
+        "toEmail": "admin@yourdomain.com",
+        "subject": "⚠️ Lead Pipeline Error",
+        "text": "Workflow error at {{ $json.execution.id }}: {{ $json.execution.error.message }}"
+      }
+    }
+  ],
+  "connections": {
+    "Meta Ads Webhook": { "main": [["Parse Lead Data"]] },
+    "Parse Lead Data": { "main": [["Detect Country (Phone Prefix)"]] },
+    "Detect Country (Phone Prefix)": { "main": [["Set Country: Ecuador"], ["Set Country: Colombia"], ["Set Country: Peru"], ["Set Country: Ecuador"]] },
+    "Set Country: Ecuador": { "main": [["Check Duplicate in Supabase"]] },
+    "Set Country: Colombia": { "main": [["Check Duplicate in Supabase"]] },
+    "Set Country: Peru": { "main": [["Check Duplicate in Supabase"]] },
+    "Check Duplicate in Supabase": { "main": [["Is Duplicate?"]] },
+    "Is Duplicate?": { "main": [[], ["Gemini AI Qualification"]] },
+    "Gemini AI Qualification": { "main": [["Parse AI Response"]] },
+    "Parse AI Response": { "main": [["Store Lead in Supabase"]] },
+    "Store Lead in Supabase": { "main": [["Send HTML Email Alert"]] },
+    "Error Handler": { "main": [["Log Error Email"]] }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "saveDataSuccessExecution": "all"
+  }
+}
